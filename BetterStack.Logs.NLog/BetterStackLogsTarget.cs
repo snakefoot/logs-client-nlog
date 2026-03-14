@@ -4,6 +4,7 @@ using NLog;
 using NLog.Config;
 using NLog.Targets;
 using NLog.Layouts;
+using NLog.Common;
 
 namespace BetterStack.Logs.NLog
 {
@@ -12,13 +13,26 @@ namespace BetterStack.Logs.NLog
     /// to the Better Stack server but it sends them periodically in batches.
     /// </summary>
     [Target("BetterStack.Logs")]
-    public sealed class BetterStackLogsTarget : TargetWithContext
+    public sealed class BetterStackLogsTarget : TargetWithLayout
     {
+        private readonly BetterStackJsonLayout _jsonLayout = new BetterStackJsonLayout();
+        private Drain betterStackDrain = null;
+
+        /// <summary>
+        /// Gets the JSON layout configuration used for formatting log entries.
+        /// </summary>
+        public JsonLayout JsonLayoutt => _jsonLayout;
+
+        /// <inheritdoc cref="BetterStackJsonLayout.Message"/>
+        public override Layout Layout
+        {
+            get => _jsonLayout.Message;
+            set => _jsonLayout.Message = value;
+        }
+
         /// <summary>
         /// Gets or sets the Better Stack Logs source token.
         /// </summary>
-        /// <value>The source token.</value>
-        [RequiredParameter]
         public Layout SourceToken { get; set; }
 
         /// <summary>
@@ -41,52 +55,55 @@ namespace BetterStack.Logs.NLog
         /// </summary>
         public int Retries { get; set; } = 10;
 
+        /// <inheritdoc cref="BetterStackJsonLayout.IncludeEventProperties"/>
+        public bool IncludeEventProperties
+        {
+            get => _jsonLayout.IncludeEventProperties;
+            set => _jsonLayout.IncludeEventProperties = value;
+        }
+
+        /// <inheritdoc cref="BetterStackJsonLayout.IncludeScopeProperties"/>
+        public bool IncludeScopeProperties
+        {
+            get => _jsonLayout.IncludeScopeProperties;
+            set => _jsonLayout.IncludeScopeProperties = value;
+        }
+
+        /// <inheritdoc cref="BetterStackJsonLayout.IncludeGdcProperties"/>
+        public bool IncludeGlobalDiagnosticContext
+        {
+            get => _jsonLayout.IncludeGdcProperties;
+            set => _jsonLayout.IncludeGdcProperties = value;
+        }
+
         /// <summary>
-        /// We capture the file and line of every log message by default. You can turn this
-        /// option off if it has negative impact on the performance of your application.
+        /// Capture the file and line of every log-message.
         /// </summary>
+        /// <remarks>Enabling this will hurt application performance as NLog will capture StackTrace for each log-message</remarks>
         public bool CaptureSourceLocation
         {
-            get => StackTraceUsage == StackTraceUsage.Max;
+            get => StackTraceUsage != StackTraceUsage.None;
             set => StackTraceUsage = value ? StackTraceUsage.Max : StackTraceUsage.None;
         }
 
-        /// <summary>
-        /// Include GlobalDiagnosticContext in logs.
-        /// </summary>
-        public bool IncludeGlobalDiagnosticContext { get; set; } = true;
-
-        /// <summary>
-        /// Control callsite capture of source-file and source-linenumber.
-        /// </summary>
+        /// <inheritdoc cref="BetterStackJsonLayout.StackTraceUsage"/>
         public StackTraceUsage StackTraceUsage
         {
-            get => _stackTraceUsage;
-            set
-            {
-                if (value == StackTraceUsage.None)
-                {
-                    IncludeCallSite = false;
-                    IncludeCallSiteStackTrace = false;
-                }
-                else
-                {
-                    IncludeCallSite = true;
-                    IncludeCallSiteStackTrace = value == StackTraceUsage.Max;
-                }
-                _stackTraceUsage = value;
-            }
+            get => _jsonLayout.StackTraceUsage;
+            set => _jsonLayout.StackTraceUsage = value;
         }
-        private StackTraceUsage _stackTraceUsage;
 
-        private Drain betterStackDrain = null;
+        /// <inheritdoc cref="BetterStackJsonLayout.Context"/>
+        /// <remarks>To replicate <see cref="TargetWithContext.ContextProperties"/></remarks>
+        [ArrayParameter(typeof(JsonAttribute), "contextproperty")]
+        public IList<JsonAttribute> ContextProperties => _jsonLayout.Context;
 
         /// <summary>
         /// Initializes a new instance of the BetterStack.Logs.NLog.BetterStackLogsTarget class.
         /// </summary>
         public BetterStackLogsTarget()
         {
-            StackTraceUsage = StackTraceUsage.Max;
+            base.Layout = _jsonLayout;
         }
 
         /// <inheritdoc/>
@@ -95,7 +112,12 @@ namespace BetterStack.Logs.NLog
             betterStackDrain?.Stop().Wait();
 
             var sourceToken = RenderLogEvent(SourceToken, LogEventInfo.CreateNullEvent());
+            if (string.IsNullOrEmpty(sourceToken))
+                throw new NLogConfigurationException("SourceToken is required for BetterStackLogsTarget.");
+
             var endpoint = RenderLogEvent(Endpoint, LogEventInfo.CreateNullEvent());
+            if (string.IsNullOrEmpty(endpoint))
+                throw new NLogConfigurationException("Endpoint is required for BetterStackLogsTarget.");
 
             var client = new Client(
                 sourceToken,
@@ -115,48 +137,26 @@ namespace BetterStack.Logs.NLog
         /// <inheritdoc/>
         protected override void CloseTarget()
         {
-            betterStackDrain?.Stop().Wait();
+            if (betterStackDrain != null && !betterStackDrain.Stop().Wait(TimeSpan.FromSeconds(15)))
+                global::NLog.Common.InternalLogger.Warn("BetterStackLogsTarget: Failed to Stop. Check for network connectivity issues.");
             base.CloseTarget();
         }
 
         /// <inheritdoc/>
         protected override void Write(LogEventInfo logEvent)
         {
-            var contextDictionary = new Dictionary<string, object> {
-                ["logger"] = logEvent.LoggerName,
-                ["properties"] = logEvent.Properties,
-                ["runtime"] = new Dictionary<string, object> {
-                    ["class"] = logEvent.CallerClassName,
-                    ["member"] = logEvent.CallerMemberName,
-                    ["file"] = string.IsNullOrEmpty(logEvent.CallerFilePath) ? null : logEvent.CallerFilePath,
-                    ["line"] = string.IsNullOrEmpty(logEvent.CallerFilePath) ? null : logEvent.CallerLineNumber as int?,
-                },
-            };
+            var payload = RenderLogEvent(_jsonLayout, logEvent);
+            if (!string.IsNullOrEmpty(payload))
+                betterStackDrain.Enqueue(payload);
+        }
 
-            if (IncludeGlobalDiagnosticContext) {
-                var gdcKeys = GlobalDiagnosticsContext.GetNames();
-
-                if (gdcKeys.Count > 0) {
-                    var gdcDict = new Dictionary<string, object>();
-
-                    foreach (string key in gdcKeys) {
-                        if (string.IsNullOrEmpty(key)) continue;
-                        gdcDict[key] = GlobalDiagnosticsContext.GetObject(key);
-                    }
-
-                    contextDictionary["gdc"] = gdcDict;
-                }
-            }
-            string logMessage = RenderLogEvent(this.Layout, logEvent);
-
-            var log = new Log {
-                Timestamp = new DateTimeOffset(logEvent.TimeStamp),
-                Message = logMessage,
-                Level = logEvent.Level.Name,
-                Context = contextDictionary
-            };
-
-            betterStackDrain.Enqueue(log);
+        /// <inheritdoc/>
+        protected override void FlushAsync(AsyncContinuation asyncContinuation)
+        {
+            if (betterStackDrain != null)
+                betterStackDrain.Flush().ContinueWith(t => asyncContinuation(t.Exception));
+            else
+                base.FlushAsync(asyncContinuation);
         }
     }
 }

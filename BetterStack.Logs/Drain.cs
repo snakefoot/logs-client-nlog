@@ -17,11 +17,11 @@ namespace BetterStack.Logs
         private readonly Client client;
         private readonly TimeSpan period;
 
-        private object taskLock = new object();
         private readonly Task runningTask;
+        private volatile Task sendTask = Task.CompletedTask;
 
-        private ConcurrentQueue<Log> queue = new ConcurrentQueue<Log>();
-        private CancellationTokenSource cancellationTokenSource;
+        private readonly ConcurrentQueue<string> queue = new ConcurrentQueue<string>();
+        private readonly CancellationTokenSource cancellationTokenSource;
 
         /// <summary>
         /// Initializes a Better Stack Logs drain and starts periodic logs delivery.
@@ -45,7 +45,7 @@ namespace BetterStack.Logs
         /// Adds a single log event to a queue. The log event will be delivered later in a batch.
         /// This method will throw an exception if the Drain is stopped.
         /// </summary>
-        public void Enqueue(Log log)
+        public void Enqueue(string log)
         {
             if (cancellationTokenSource.IsCancellationRequested) throw new DrainIsClosedException();
 
@@ -61,47 +61,52 @@ namespace BetterStack.Logs
             await runningTask;
         }
 
+        /// <summary>
+        /// Waits for the pending queue to be flushed.
+        /// </summary>
+        public async Task Flush()
+        {
+            for (int i = 0; i < 3; ++i)
+            {
+                if (queue.IsEmpty)
+                    break;
+                await Task.Delay(period);
+                await sendTask;
+            }
+            await Task.Delay(period);
+            await sendTask;
+        }
+
         private async Task run() {
             var nextDelay = period;
+
+            var nextBatch = new List<string>();
 
             // XXX: We want the loop to run at least once, even if we stop
             //      the drain before the we manage to reach this point.
             do {
-                var flushDuration = await delayed(flush, nextDelay);
+                if (nextDelay > TimeSpan.Zero) {
+                    try {
+                        await Task.Delay(nextDelay, cancellationTokenSource.Token);
+                    } catch (OperationCanceledException) {
+                        // finish the rest of the loop to flush everything
+                    }
+                }
+
+                var start = DateTime.UtcNow;
+                while (!queue.IsEmpty)
+                {
+                    nextBatch.Clear();
+                    while (nextBatch.Count < maxBatchSize && queue.TryDequeue(out var log))
+                        nextBatch.Add(log);
+
+                    sendTask = client.Send(nextBatch);
+                    await sendTask;
+                    sendTask = Task.CompletedTask;
+                }
+                var flushDuration = DateTime.UtcNow - start;
                 nextDelay = period - flushDuration;
             } while (!cancellationTokenSource.IsCancellationRequested);
-        }
-
-        private async Task flush() {
-            while (!queue.IsEmpty) {
-                var expectedItemsCount = Math.Min(maxBatchSize, queue.Count);
-                var nextBatch = new List<Log>(expectedItemsCount);
-
-                while (!queue.IsEmpty && nextBatch.Count < maxBatchSize) {
-                    if (queue.TryDequeue(out var log)) nextBatch.Add(log);
-                }
-
-                if (nextBatch.Count > 0) {
-                    await client.Send(nextBatch);
-                }
-            }
-        }
-
-        private async Task<TimeSpan> delayed(Func<Task> asyncAction, TimeSpan delay)
-        {
-            if (delay < TimeSpan.Zero) delay = TimeSpan.Zero;
-
-            try {
-                await Task.Delay(delay, cancellationTokenSource.Token);
-            } catch (TaskCanceledException) {
-                // finish the rest of the loop to flush everything
-            }
-
-            var start = DateTimeOffset.UtcNow;
-
-            await asyncAction();
-
-            return DateTimeOffset.UtcNow - start;
         }
     }
 }

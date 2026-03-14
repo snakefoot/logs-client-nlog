@@ -10,7 +10,7 @@ namespace BetterStack.Logs.NLog
 {
     public class ColorValueFormatter : IValueFormatter
     {
-        IValueFormatter valueFormatter;
+        private readonly IValueFormatter valueFormatter;
 
         private const string AnsiRed = "\x1b[31;1m";
         private const string AnsiGreen = "\x1b[32;1m";
@@ -22,7 +22,7 @@ namespace BetterStack.Logs.NLog
 
         public ColorValueFormatter(IValueFormatter valueFormatter = null)
         {
-            this.valueFormatter = valueFormatter != null ? valueFormatter : ConfigurationItemFactory.Default.ValueFormatter;
+            this.valueFormatter = valueFormatter != null ? valueFormatter : global::NLog.LogManager.LogFactory.ServiceRepository.GetService(typeof(IValueFormatter)) as IValueFormatter;
         }
 
         public bool FormatValue(

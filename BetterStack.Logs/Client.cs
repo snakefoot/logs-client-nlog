@@ -1,10 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Net;
 using System.Net.Http;
 using System.Text;
 using System.Threading.Tasks;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Serialization;
 
 namespace BetterStack.Logs
 {
@@ -14,13 +13,10 @@ namespace BetterStack.Logs
     public sealed class Client
     {
         private readonly HttpClient httpClient;
-        private readonly JsonSerializerSettings settings = new JsonSerializerSettings {
-            ReferenceLoopHandling = ReferenceLoopHandling.Ignore,
-            ContractResolver = new DefaultContractResolver {
-                NamingStrategy = new CamelCaseNamingStrategy()
-            }
-        };
         private readonly int retries;
+        private readonly StringBuilder _payloadBuilder = new StringBuilder();
+        private readonly System.Net.Http.Headers.MediaTypeHeaderValue _contentTypeJson = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+        private readonly char[] _reusableEncodingBuffer = new char[40 * 1024];  // Avoid Large-Object-Heap (LOH)
 
         public Client(
             string sourceToken,
@@ -29,19 +25,13 @@ namespace BetterStack.Logs
             int retries = 10
         )
         {
-            settings.Converters.Add(new Newtonsoft.Json.Converters.StringEnumConverter());
-            settings.Converters.Add(new ToStringJsonConverter(typeof(System.Reflection.MemberInfo)));
-            settings.Converters.Add(new ToStringJsonConverter(typeof(System.Reflection.Assembly)));
-            settings.Converters.Add(new ToStringJsonConverter(typeof(System.Reflection.Module)));
-            settings.Error = (sender, args) =>
-            {
-                args.ErrorContext.Handled = true;   // Ignore Properties that throws Exceptions
-            };
-
             httpClient = new HttpClient();
             httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {sourceToken}");
             httpClient.BaseAddress = new Uri(endpoint);
             httpClient.Timeout = timeout ?? TimeSpan.FromSeconds(10);
+#if NETFRAMEWORK
+            httpClient.DefaultRequestHeaders.ExpectContinue = false;  // Avoid 100-Continue delay on .NET Framework. Default turned off for .NET Core and later
+#endif
 
             this.retries = retries;
         }
@@ -50,75 +40,96 @@ namespace BetterStack.Logs
         /// Sends a collection of logs to the server with several retries
         /// if an error occures.
         /// </summary>
-        public async Task Send(IEnumerable<Log> logs)
+        public async Task Send(List<string> logs)
         {
             var content = serialize(logs);
+            logs.Clear();  // Allow garbage collection, while waiting for the request to complete
 
             for (int i = 0; i < retries; ++i) {
-                await Task.Delay(TimeSpan.FromSeconds(i));
-
                 var success = await sendOnce(content);
                 if (success) break;
+
+                await Task.Delay(TimeSpan.FromSeconds(i));
             }
         }
 
         private async Task<bool> sendOnce(HttpContent content)
         {
-            try {
-                var response = await httpClient.PostAsync("/", content);
-                return response.IsSuccessStatusCode;
-            } catch (TaskCanceledException) {
-                // request timed out, silent error
-            } catch (HttpRequestException) {
-                // TODO: repeat only for certain HTTP errors (429, 5xx)
-                // some networking error, silent error
+            var httpStatusCode = default(HttpStatusCode);
+            try
+            {
+                using (var response = await httpClient.PostAsync("/", content))
+                {
+                    httpStatusCode = response.StatusCode;
+                    response.EnsureSuccessStatusCode();  // Throw if not a success code
+                    return true;
+                }
+            }
+            catch (HttpRequestException ex)
+            {
+                global::NLog.Common.InternalLogger.Warn(ex, "BetterStackLogsTarget: HTTP request failed with status code {0}", (int)httpStatusCode);
+
+#if NET || NETSTANDARD2_1_OR_GREATER
+                if (httpStatusCode == HttpStatusCode.TooManyRequests || httpStatusCode == HttpStatusCode.RequestTimeout || ((int)httpStatusCode >= 500 && httpStatusCode != HttpStatusCode.NetworkAuthenticationRequired))
+#else
+                if ((int)httpStatusCode == 429 || httpStatusCode == HttpStatusCode.RequestTimeout || ((int)httpStatusCode >= 500 && (int)httpStatusCode != 511))
+#endif
+                {
+                    // TODO retry only 429 + 408 + 5xx (server errors, typically transient)
+                }
+            }
+            catch (OperationCanceledException ex)
+            {
+                global::NLog.Common.InternalLogger.Warn(ex, "BetterStackLogsTarget: Http Request timed out.");
+            }
+            catch (Exception ex)
+            {
+                global::NLog.Common.InternalLogger.Warn(ex, "BetterStackLogsTarget: Http Request failed.");
             }
 
             return false;
         }
 
-        private HttpContent serialize(IEnumerable<Log> logs) {
-            var payload = JsonConvert.SerializeObject(logs, settings);
-            var content = new ByteArrayContent(Encoding.UTF8.GetBytes(payload));
-            content.Headers.Add("Content-Type", "application/json");
-            return content;
-        }
-
-        /// <summary>
-        /// JSON converter that just calls ToString on the target value (when non-null).
-        /// This is configured as the converter for types that will otherwise spew a lot of irrelevant JSON
-        /// into logs.
-        /// </summary>
-        internal sealed class ToStringJsonConverter : JsonConverter
-        {
-            private readonly System.Type _type;
-
-            /// <inheritdoc />
-            public override bool CanRead => false;
-
-            public ToStringJsonConverter(System.Type type) =>
-                _type = type;
-
-            /// <inheritdoc />
-            public override void WriteJson(JsonWriter writer, object value, JsonSerializer serializer)
+        private HttpContent serialize(List<string> logs) {
+            lock (_payloadBuilder)
             {
-                if (value is null)
+                try
                 {
-                    writer.WriteNull();
+                    _payloadBuilder.Length = 0;
+                    _payloadBuilder.Append('[');
+                    foreach (var log in logs)
+                    {
+                        if (_payloadBuilder.Length > 1)
+                            _payloadBuilder.Append(',');
+                        _payloadBuilder.Append(log);
+                    }
+                    _payloadBuilder.Append(']');
+                    var content = new ByteArrayContent(EncodePayload(Encoding.UTF8, _payloadBuilder));
+                    content.Headers.ContentType = _contentTypeJson;
+                    return content;
                 }
-                else
+                finally
                 {
-                    writer.WriteValue(value.ToString());
+                    if (_payloadBuilder.Length > _reusableEncodingBuffer.Length)
+                        _payloadBuilder.Remove(0, _payloadBuilder.Length - 1);  // Attempt soft clear that skips Large-Object-Heap (LOH) re-allocation
+                    _payloadBuilder.Length = 0;
                 }
             }
+        }
 
-            /// <inheritdoc />
-            public override object ReadJson(JsonReader reader, System.Type objectType, object existingValue, JsonSerializer serializer) =>
-                throw new NotSupportedException("Only serialization is supported");
+        byte[] EncodePayload(Encoding encoder, StringBuilder payload)
+        {
+            lock (_reusableEncodingBuffer)
+            {
+                var payloadLength = payload.Length;
+                if (payloadLength < _reusableEncodingBuffer.Length)
+                {
+                    payload.CopyTo(0, _reusableEncodingBuffer, 0, payloadLength);
+                    return encoder.GetBytes(_reusableEncodingBuffer, 0, payloadLength);
+                }
 
-            /// <inheritdoc />
-            public override bool CanConvert(System.Type objectType) =>
-                _type.IsAssignableFrom(objectType);
+                return encoder.GetBytes(payload.ToString());
+            }
         }
     }
 }
